@@ -14,13 +14,15 @@ enum CompressedPointFlag {
     Infinity = COMPRESSED_INFINITY as isize,
 }
 
-impl From<u8> for CompressedPointFlag {
-    fn from(val: u8) -> Self {
+impl TryFrom<u8> for CompressedPointFlag {
+    type Error = anyhow::Error;
+
+    fn try_from(val: u8) -> anyhow::Result<Self> {
         match val {
-            COMPRESSED_POSITIVE => CompressedPointFlag::Positive,
-            COMPRESSED_NEGATIVE => CompressedPointFlag::Negative,
-            COMPRESSED_INFINITY => CompressedPointFlag::Infinity,
-            _ => panic!("Invalid compressed point flag"),
+            COMPRESSED_POSITIVE => Ok(CompressedPointFlag::Positive),
+            COMPRESSED_NEGATIVE => Ok(CompressedPointFlag::Negative),
+            COMPRESSED_INFINITY => Ok(CompressedPointFlag::Infinity),
+            _ => Err(anyhow!("invalid compressed point flag: {}", val)),
         }
     }
 }
@@ -50,11 +52,11 @@ fn deserialize_with_flags(buf: &[u8]) -> Result<(Fq, CompressedPointFlag)> {
 
         let x = Fq::from_be_bytes_mod_order(&x_bytes).expect("Failed to convert x bytes to Fq");
 
-        Ok((x, m_data.into()))
+        Ok((x, CompressedPointFlag::try_from(m_data)?))
     }
 }
 
-pub(crate) fn unchecked_compressed_x_to_g1_point(buf: &[u8]) -> Result<AffineG1> {
+pub fn unchecked_compressed_x_to_g1_point(buf: &[u8]) -> Result<AffineG1> {
     let (x, m_data) = deserialize_with_flags(buf)?;
     let (y, neg_y) = AffineG1::get_ys_from_x_unchecked(x).ok_or(anyhow!("invalid point"))?;
 
@@ -70,7 +72,7 @@ pub(crate) fn unchecked_compressed_x_to_g1_point(buf: &[u8]) -> Result<AffineG1>
     Ok(AffineG1::new_unchecked(x, final_y))
 }
 
-pub(crate) fn uncompressed_bytes_to_g1_point(buf: &[u8]) -> Result<AffineG1> {
+pub fn uncompressed_bytes_to_g1_point(buf: &[u8]) -> Result<AffineG1> {
     if buf.len() != 64 {
         return Err(anyhow!("invalid g1 length"));
     };
@@ -82,7 +84,7 @@ pub(crate) fn uncompressed_bytes_to_g1_point(buf: &[u8]) -> Result<AffineG1> {
     AffineG1::new(x, y).map_err(|x| anyhow!("not on curve: {}", x))
 }
 
-pub(crate) fn unchecked_compressed_x_to_g2_point(buf: &[u8]) -> Result<AffineG2> {
+pub fn unchecked_compressed_x_to_g2_point(buf: &[u8]) -> Result<AffineG2> {
     if buf.len() != 64 {
         return Err(anyhow!("invalid g2 x length"));
     };
@@ -104,7 +106,7 @@ pub(crate) fn unchecked_compressed_x_to_g2_point(buf: &[u8]) -> Result<AffineG2>
     }
 }
 
-pub(crate) fn uncompressed_bytes_to_g2_point(buf: &[u8]) -> Result<AffineG2> {
+pub fn uncompressed_bytes_to_g2_point(buf: &[u8]) -> Result<AffineG2> {
     if buf.len() != 128 {
         return Err(anyhow!("invalid g2 length"));
     }

@@ -4,11 +4,21 @@ use super::{
 };
 use anyhow::{anyhow, Result};
 use bn::{pairing_batch, AffineG1, AffineG2, Fr, Gt, G1, G2};
+use core::fmt::Debug;
 
 pub struct Groth16Proof {
+    #[allow(dead_code)]
     pub(crate) ar: AffineG1,
+    #[allow(dead_code)]
     pub(crate) krs: AffineG1,
+    #[allow(dead_code)]
     pub(crate) bs: AffineG2,
+}
+
+impl Debug for Groth16Proof {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Groth16Proof").finish()
+    }
 }
 
 fn prepare_inputs(vk: &Groth16VKey, public_inputs: &[Fr]) -> Result<G1> {
