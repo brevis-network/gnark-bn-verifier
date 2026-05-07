@@ -3,7 +3,7 @@ use super::{
     vk::Groth16VKey,
 };
 use anyhow::{anyhow, Result};
-use bn::{pairing_batch, AffineG1, AffineG2, Fr, Gt, G1, G2};
+use bn::{pairing_batch, AffineG1, AffineG2, Fr, Gt, G1};
 use core::fmt::Debug;
 
 pub struct Groth16Proof {
@@ -41,7 +41,7 @@ impl Groth16Proof {
             (-Into::<G1>::into(self.ar), self.bs.into()),
             (prepared_inputs, vk.g2.gamma.into()),
             (self.krs.into(), vk.g2.delta.into()),
-            (vk.g1.alpha.into(), -Into::<G2>::into(vk.g2.beta)),
+            (vk.g1.alpha.into(), vk.g2.beta.into()),
         ]) == Gt::one()
         {
             Ok(())
@@ -56,7 +56,7 @@ impl<'a> TryFrom<&'a [u8]> for Groth16Proof {
     type Error = anyhow::Error;
 
     fn try_from(buffer: &'a [u8]) -> anyhow::Result<Self> {
-        if buffer.len() < 256 {
+        if buffer.len() != 256 {
             return Err(anyhow!("invalid groth16 proof length: {}", buffer.len()));
         }
 

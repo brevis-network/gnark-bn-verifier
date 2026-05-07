@@ -40,17 +40,17 @@ fn deserialize_with_flags(buf: &[u8]) -> Result<(Fq, CompressedPointFlag)> {
 
     let m_data = buf[0] & MASK;
     if m_data == u8::from(CompressedPointFlag::Infinity) {
-        // Checks if the first byte is zero after masking AND the rest of the bytes are zero.
-        if buf[0] & !MASK == 0 && buf[1..].iter().all(|&b| b == 0) {
-            return Err(anyhow!("invalid point"));
+        if buf[0] & !MASK != 0 || buf[1..].iter().any(|&b| b != 0) {
+            return Err(anyhow!("invalid infinity encoding"));
         }
+
         Ok((Fq::zero(), CompressedPointFlag::Infinity))
     } else {
         let mut x_bytes: [u8; 32] = [0u8; 32];
         x_bytes.copy_from_slice(buf);
         x_bytes[0] &= !MASK;
 
-        let x = Fq::from_be_bytes_mod_order(&x_bytes).expect("Failed to convert x bytes to Fq");
+        let x = Fq::from_slice(&x_bytes).map_err(|x| anyhow!("not Fq: {}", x))?;
 
         Ok((x, CompressedPointFlag::try_from(m_data)?))
     }
@@ -58,6 +58,10 @@ fn deserialize_with_flags(buf: &[u8]) -> Result<(Fq, CompressedPointFlag)> {
 
 pub fn unchecked_compressed_x_to_g1_point(buf: &[u8]) -> Result<AffineG1> {
     let (x, m_data) = deserialize_with_flags(buf)?;
+    if m_data == CompressedPointFlag::Infinity {
+        return Err(anyhow!("point at infinity is not supported"));
+    }
+
     let (y, neg_y) = AffineG1::get_ys_from_x_unchecked(x).ok_or(anyhow!("invalid point"))?;
 
     let mut final_y = y;
@@ -90,12 +94,16 @@ pub fn unchecked_compressed_x_to_g2_point(buf: &[u8]) -> Result<AffineG2> {
     };
 
     let (x1, flag) = deserialize_with_flags(&buf[..32])?;
-    let x0 = Fq::from_be_bytes_mod_order(&buf[32..64]).map_err(|x| anyhow!("not Fq: {}", x))?;
-    let x = Fq2::new(x0, x1);
-
     if flag == CompressedPointFlag::Infinity {
-        return Ok(AffineG2::one());
+        if buf[32..64].iter().any(|&b| b != 0) {
+            return Err(anyhow!("invalid infinity encoding"));
+        }
+
+        return Err(anyhow!("point at infinity is not supported"));
     }
+
+    let x0 = Fq::from_slice(&buf[32..64]).map_err(|x| anyhow!("not Fq: {}", x))?;
+    let x = Fq2::new(x0, x1);
 
     let (y, neg_y) = AffineG2::get_ys_from_x_unchecked(x).ok_or(anyhow!("invalid point"))?;
 

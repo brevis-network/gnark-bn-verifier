@@ -1,43 +1,78 @@
-use bn::Fr;
+use bn::{AffineG1, AffineG2, Fq, Fr, Group, Gt, G1, G2};
 use gnark_bn_verifier::{
-    io::{uncompressed_bytes_to_g1_point, uncompressed_bytes_to_g2_point},
+    io::{
+        unchecked_compressed_x_to_g1_point, unchecked_compressed_x_to_g2_point,
+        uncompressed_bytes_to_g1_point, uncompressed_bytes_to_g2_point,
+    },
     proof::Groth16Proof,
     vk::Groth16VKey,
 };
 
-// Helper: create a valid VK with given num_k
-fn create_valid_vk_bytes(num_k: u32) -> Vec<u8> {
+const COMPRESSED_POSITIVE: u8 = 0b10 << 6;
+const COMPRESSED_NEGATIVE: u8 = 0b11 << 6;
+const COMPRESSED_INFINITY: u8 = 0b01 << 6;
+
+fn fq_to_bytes(fq: Fq) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    fq.to_big_endian(&mut bytes).unwrap();
+    bytes
+}
+
+fn compressed_g1(point: AffineG1) -> [u8; 32] {
+    let mut bytes = fq_to_bytes(point.x());
+    bytes[0] |= if point.y() <= -point.y() {
+        COMPRESSED_POSITIVE
+    } else {
+        COMPRESSED_NEGATIVE
+    };
+    bytes
+}
+
+fn compressed_g2(point: AffineG2) -> [u8; 64] {
+    let mut bytes = [0u8; 64];
+    let x = point.x();
+    bytes[..32].copy_from_slice(&fq_to_bytes(x.imaginary()));
+    bytes[32..].copy_from_slice(&fq_to_bytes(x.real()));
+
+    let (positive_y, negative_y) = AffineG2::get_ys_from_x_unchecked(x).unwrap();
+    bytes[0] |= if point.y() == positive_y {
+        COMPRESSED_POSITIVE
+    } else {
+        assert_eq!(point.y(), negative_y);
+        COMPRESSED_NEGATIVE
+    };
+    bytes
+}
+
+fn uncompressed_g1(point: AffineG1) -> [u8; 64] {
+    let mut bytes = [0u8; 64];
+    bytes[..32].copy_from_slice(&fq_to_bytes(point.x()));
+    bytes[32..].copy_from_slice(&fq_to_bytes(point.y()));
+    bytes
+}
+
+fn uncompressed_g2(point: AffineG2) -> [u8; 128] {
+    let mut bytes = [0u8; 128];
+    let x = point.x();
+    let y = point.y();
+    bytes[..32].copy_from_slice(&fq_to_bytes(x.imaginary()));
+    bytes[32..64].copy_from_slice(&fq_to_bytes(x.real()));
+    bytes[64..96].copy_from_slice(&fq_to_bytes(y.imaginary()));
+    bytes[96..].copy_from_slice(&fq_to_bytes(y.real()));
+    bytes
+}
+
+fn vk_bytes_with_gamma(num_k: u32, gamma: AffineG2) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(292 + (num_k as usize) * 32);
-
-    // g1_alpha (32 bytes)
-    let mut alpha = [0u8; 32];
-    alpha[0] = 0x02; // positive flag
-    buffer.extend_from_slice(&alpha);
-
-    // padding (32 bytes)
+    buffer.extend_from_slice(&compressed_g1(AffineG1::one()));
     buffer.extend_from_slice(&[0u8; 32]);
-
-    // g2_beta (64 bytes)
-    let mut beta = [0u8; 64];
-    beta[0] = 0x02;
-    buffer.extend_from_slice(&beta);
-
-    // g2_gamma (64 bytes)
-    let mut gamma = [0u8; 64];
-    gamma[0] = 0x02;
-    buffer.extend_from_slice(&gamma);
-
-    // g2_delta (64 bytes)
-    let mut delta = [0u8; 64];
-    delta[0] = 0x02;
-    buffer.extend_from_slice(&delta);
-
-    // num_k (4 bytes, big-endian)
+    buffer.extend_from_slice(&compressed_g2(AffineG2::one()));
+    buffer.extend_from_slice(&compressed_g2(gamma));
+    buffer.extend_from_slice(&[0u8; 32]);
+    buffer.extend_from_slice(&compressed_g2(AffineG2::one()));
     buffer.extend_from_slice(&num_k.to_be_bytes());
 
-    // K points (num_k * 32 bytes)
-    let mut k = [0u8; 32];
-    k[0] = 0x02;
+    let k = compressed_g1(AffineG1::one());
     for _ in 0..num_k {
         buffer.extend_from_slice(&k);
     }
@@ -45,113 +80,83 @@ fn create_valid_vk_bytes(num_k: u32) -> Vec<u8> {
     buffer
 }
 
-// Helper: create a valid proof bytes with given structure
-fn create_valid_proof_bytes() -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(256);
+fn vk_bytes(num_k: u32) -> Vec<u8> {
+    vk_bytes_with_gamma(num_k, -AffineG2::one())
+}
 
-    // ar (64 bytes G1 uncompressed)
-    buffer.extend_from_slice(&[0u8; 64]);
-
-    // bs (128 bytes G2 uncompressed)
-    buffer.extend_from_slice(&[0u8; 128]);
-
-    // krs (64 bytes G1 uncompressed)
-    buffer.extend_from_slice(&[0u8; 64]);
-
+fn vk_header_with_num_k(num_k: u32) -> Vec<u8> {
+    let mut buffer = vk_bytes(1);
+    buffer.truncate(292);
+    buffer[288..292].copy_from_slice(&num_k.to_be_bytes());
     buffer
+}
+
+fn proof_bytes() -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(256);
+    buffer.extend_from_slice(&uncompressed_g1(AffineG1::one()));
+    buffer.extend_from_slice(&uncompressed_g2(AffineG2::one()));
+    buffer.extend_from_slice(&uncompressed_g1(AffineG1::one()));
+    buffer
+}
+
+fn modulus_bytes_with_flag() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    Fq::modulus().to_big_endian(&mut bytes).unwrap();
+    bytes[0] |= COMPRESSED_POSITIVE;
+    bytes
 }
 
 mod vk_tests {
     use super::*;
 
     #[test]
-    fn test_vk_buffer_too_short() {
-        let buffer = vec![0u8; 100]; // too short
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("too short"), "Expected 'too short' error, got: {}", err);
+    fn rejects_short_vk_buffer() {
+        let err = Groth16VKey::try_from(vec![0u8; 100].as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too short"));
     }
 
     #[test]
-    fn test_vk_num_k_zero() {
-        let buffer = create_valid_vk_bytes(0);
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        // num_k = 0 is allowed but buffer should still have exactly 292 bytes
-        // since num_k * 32 = 0
-        assert!(result.is_ok() || result.unwrap_err().to_string().contains("short"));
+    fn rejects_zero_k_count() {
+        let err = Groth16VKey::try_from(vk_header_with_num_k(0).as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least 1"));
     }
 
     #[test]
-    fn test_vk_num_k_too_large() {
-        let buffer = create_valid_vk_bytes(1_000_001); // exceeds MAX_K_COUNT
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        // Either num_k limit or point parsing error is acceptable
-        // but should not be buffer-too-short
-        assert!(
-            err.contains("too large") || err.contains("invalid"),
-            "Expected 'too large' or 'invalid' error, got: {}",
-            err
-        );
+    fn rejects_too_large_k_count_before_allocating_k_points() {
+        let err = Groth16VKey::try_from(vk_header_with_num_k(1_000_001).as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too large"));
     }
 
     #[test]
-    fn test_vk_buffer_insufficient_for_k_points() {
-        // Create buffer that claims 10 k points but only provides 5
-        let mut buffer = create_valid_vk_bytes(5);
-        // Overwrite num_k to claim 10
-        buffer[288..292].copy_from_slice(&10u32.to_be_bytes());
-        // Don't add more k points, buffer is now too short
-
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        assert!(result.is_err());
+    fn rejects_vk_with_missing_k_points() {
+        let mut buffer = vk_bytes(2);
+        buffer.truncate(buffer.len() - 32);
+        let err = Groth16VKey::try_from(buffer.as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid vkey length"));
     }
 
     #[test]
-    fn test_vk_valid_single_k() {
-        let buffer = create_valid_vk_bytes(1);
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        // May fail due to invalid point data, but shouldn't panic
-        // and should not be OOM or buffer error
-        if result.is_err() {
-            let err = result.unwrap_err().to_string();
-            assert!(!err.contains("too short") && !err.contains("too large"));
-        }
+    fn rejects_vk_with_trailing_bytes() {
+        let mut buffer = vk_bytes(1);
+        buffer.push(0);
+        let err = Groth16VKey::try_from(buffer.as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid vkey length"));
     }
 
     #[test]
-    fn test_vk_valid_multiple_k() {
-        let buffer = create_valid_vk_bytes(100);
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        if result.is_err() {
-            let err = result.unwrap_err().to_string();
-            assert!(!err.contains("OOM"), "Should not OOM on reasonable k count");
-        }
-    }
-
-    #[test]
-    fn test_vk_exact_boundary() {
-        // Test with exactly MAX_K_COUNT
-        let buffer = create_valid_vk_bytes(1_000_000);
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        // Should not fail due to count limit
-        // May fail on actual point data, but not due to bounds
-        if result.is_err() {
-            let err = result.unwrap_err().to_string();
-            assert!(!err.contains("too large"));
-        }
-    }
-
-    #[test]
-    fn test_vk_num_public_inputs_method() {
-        let buffer = create_valid_vk_bytes(6); // k.len() = 6, so 5 public inputs expected
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        if result.is_ok() {
-            let vk = result.unwrap();
-            assert_eq!(vk.num_public_inputs(), 5);
-        }
+    fn parses_valid_vk_and_reports_public_input_count() {
+        let vk = Groth16VKey::try_from(vk_bytes(6).as_slice()).unwrap();
+        assert_eq!(vk.num_public_inputs(), 5);
     }
 }
 
@@ -159,31 +164,26 @@ mod proof_tests {
     use super::*;
 
     #[test]
-    fn test_proof_buffer_too_short() {
-        let buffer = vec![0u8; 100]; // less than 256
-        let result = Groth16Proof::try_from(buffer.as_slice());
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("invalid groth16 proof length"),
-            "Expected 'invalid groth16 proof length' error, got: {}",
-            err
-        );
+    fn rejects_short_proof_buffer() {
+        let err = Groth16Proof::try_from(vec![0u8; 100].as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid groth16 proof length"));
     }
 
     #[test]
-    fn test_proof_exact_min_length() {
-        let buffer = vec![0u8; 256];
-        let result = Groth16Proof::try_from(buffer.as_slice());
-        // Will fail on point parsing but not length check
-        assert!(result.is_err() || result.is_ok());
+    fn rejects_proof_with_trailing_bytes() {
+        let mut buffer = proof_bytes();
+        buffer.push(0);
+        let err = Groth16Proof::try_from(buffer.as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid groth16 proof length"));
     }
 
     #[test]
-    fn test_proof_larger_than_min() {
-        let buffer = vec![0u8; 300];
-        let result = Groth16Proof::try_from(buffer.as_slice());
-        assert!(result.is_err() || result.is_ok());
+    fn parses_exact_length_proof() {
+        Groth16Proof::try_from(proof_bytes().as_slice()).unwrap();
     }
 }
 
@@ -191,35 +191,70 @@ mod io_tests {
     use super::*;
 
     #[test]
-    fn test_g1_uncompressed_valid_length() {
-        // 64 bytes: 32 for x, 32 for y
-        let buffer = [0u8; 64];
-        let result = uncompressed_bytes_to_g1_point(&buffer);
-        // Zero point should be valid (0,0) technically is not on curve,
-        // but from_slice might handle it differently
-        assert!(result.is_ok() || result.is_err());
+    fn parses_valid_compressed_g1_and_g2_points() {
+        unchecked_compressed_x_to_g1_point(&compressed_g1(AffineG1::one())).unwrap();
+        unchecked_compressed_x_to_g2_point(&compressed_g2(AffineG2::one())).unwrap();
     }
 
     #[test]
-    fn test_g1_uncompressed_invalid_length() {
-        let buffer = [0u8; 63];
-        let result = uncompressed_bytes_to_g1_point(&buffer);
-        assert!(result.is_err());
+    fn rejects_non_canonical_compressed_field_element() {
+        let err = unchecked_compressed_x_to_g1_point(&modulus_bytes_with_flag())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not Fq"));
     }
 
     #[test]
-    fn test_g2_uncompressed_valid_length() {
-        // 128 bytes for G2
-        let buffer = [0u8; 128];
-        let result = uncompressed_bytes_to_g2_point(&buffer);
-        assert!(result.is_ok() || result.is_err());
+    fn rejects_compressed_g1_infinity() {
+        let mut buffer = [0u8; 32];
+        buffer[0] = COMPRESSED_INFINITY;
+        let err = unchecked_compressed_x_to_g1_point(&buffer)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("infinity"));
     }
 
     #[test]
-    fn test_g2_uncompressed_invalid_length() {
-        let buffer = [0u8; 64]; // should be 128
-        let result = uncompressed_bytes_to_g2_point(&buffer);
-        assert!(result.is_err());
+    fn rejects_nonzero_compressed_g1_infinity_payload() {
+        let mut buffer = [0u8; 32];
+        buffer[0] = COMPRESSED_INFINITY | 1;
+        let err = unchecked_compressed_x_to_g1_point(&buffer)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid infinity encoding"));
+    }
+
+    #[test]
+    fn rejects_compressed_g2_infinity() {
+        let mut buffer = [0u8; 64];
+        buffer[0] = COMPRESSED_INFINITY;
+        let err = unchecked_compressed_x_to_g2_point(&buffer)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("infinity"));
+    }
+
+    #[test]
+    fn rejects_nonzero_compressed_g2_infinity_payload() {
+        let mut buffer = [0u8; 64];
+        buffer[0] = COMPRESSED_INFINITY;
+        buffer[32] = 1;
+        let err = unchecked_compressed_x_to_g2_point(&buffer)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid infinity encoding"));
+    }
+
+    #[test]
+    fn parses_valid_uncompressed_g1_and_g2_points() {
+        uncompressed_bytes_to_g1_point(&uncompressed_g1(AffineG1::one())).unwrap();
+        uncompressed_bytes_to_g2_point(&uncompressed_g2(AffineG2::one())).unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_uncompressed_lengths() {
+        assert!(uncompressed_bytes_to_g1_point(&[0u8; 63]).is_err());
+        assert!(uncompressed_bytes_to_g2_point(&[0u8; 64]).is_err());
     }
 }
 
@@ -227,189 +262,43 @@ mod verification_tests {
     use super::*;
 
     #[test]
-    fn test_verify_with_mismatched_input_length() {
-        // Create a VK with 5 public inputs expected
-        let vk_bytes = create_valid_vk_bytes(6); // k has 6 points, so 5 inputs expected
-        let vk = Groth16VKey::try_from(vk_bytes.as_slice());
-        if vk.is_err() {
-            return; // Skip if VK is invalid due to point data
-        }
-        let vk = vk.unwrap();
-
-        // Create proof
-        let proof_bytes = create_valid_proof_bytes();
-        let proof = Groth16Proof::try_from(proof_bytes.as_slice());
-        if proof.is_err() {
-            return; // Skip if proof is invalid
-        }
-        let proof = proof.unwrap();
-
-        // Provide wrong number of inputs (e.g., 3 instead of 5)
+    fn verify_reports_mismatched_input_length_before_pairing() {
+        let vk = Groth16VKey::try_from(vk_bytes(6).as_slice()).unwrap();
+        let proof = Groth16Proof::try_from(proof_bytes().as_slice()).unwrap();
         let inputs = [Fr::one(), Fr::one(), Fr::one()];
 
-        let result = proof.verify(&vk, &inputs);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("input length mismatch"),
-            "Expected 'input length mismatch' error, got: {}",
-            err
-        );
+        let err = proof.verify(&vk, &inputs).unwrap_err().to_string();
+        assert!(err.contains("input length mismatch"));
     }
 
     #[test]
-    fn test_verify_with_zero_inputs() {
-        // VK with 1 public input (k.len() == 1 means 0 public inputs)
-        let vk_bytes = create_valid_vk_bytes(1);
-        let vk = Groth16VKey::try_from(vk_bytes.as_slice());
-        if vk.is_err() {
-            return;
-        }
-        let vk = vk.unwrap();
+    fn fake_but_well_formed_proof_fails_verification() {
+        let vk = Groth16VKey::try_from(vk_bytes_with_gamma(1, AffineG2::one()).as_slice()).unwrap();
+        let proof = Groth16Proof::try_from(proof_bytes().as_slice()).unwrap();
+        let err = proof.verify(&vk, &[]).unwrap_err().to_string();
+        assert!(err.contains("groth16 verification"));
+    }
 
-        let proof_bytes = create_valid_proof_bytes();
-        let proof = Groth16Proof::try_from(proof_bytes.as_slice());
-        if proof.is_err() {
-            return;
-        }
-        let proof = proof.unwrap();
-
-        // Empty public inputs
-        let inputs: [Fr; 0] = [];
-        let result = proof.verify(&vk, &inputs);
-        // Should either succeed or fail due to invalid proof, not panic
-        assert!(result.is_ok() || result.is_err());
+    #[test]
+    fn matching_well_formed_proof_verifies() {
+        let vk = Groth16VKey::try_from(vk_bytes(1).as_slice()).unwrap();
+        let proof = Groth16Proof::try_from(proof_bytes().as_slice()).unwrap();
+        proof.verify(&vk, &[]).unwrap();
     }
 }
 
-mod edge_case_tests {
+mod pairing_tests {
     use super::*;
 
     #[test]
-    fn test_vk_empty_buffer() {
-        let buffer = Vec::new();
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        assert!(result.is_err());
+    fn pairing_with_generator_points_completes() {
+        let result = bn::pairing_batch(&[(G1::one(), G2::one())]);
+        assert_ne!(result, Gt::one());
     }
 
     #[test]
-    fn test_proof_empty_buffer() {
-        let buffer = Vec::new();
-        let result = Groth16Proof::try_from(buffer.as_slice());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_vk_num_k_exactly_max() {
-        let buffer = create_valid_vk_bytes(1_000_000);
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        // Should process without OOM
-        if result.is_ok() {
-            let vk = result.unwrap();
-            assert_eq!(vk.num_public_inputs(), 999_999);
-        }
-    }
-
-    #[test]
-    fn test_verify_does_not_panic_on_invalid_proof() {
-        let vk_bytes = create_valid_vk_bytes(1);
-        let vk = Groth16VKey::try_from(vk_bytes.as_slice());
-        if vk.is_err() {
-            return;
-        }
-        let vk = vk.unwrap();
-
-        // Create proof with garbage data
-        let proof_bytes = vec![0xFF; 256];
-        let proof = Groth16Proof::try_from(proof_bytes.as_slice());
-
-        if proof.is_ok() {
-            let proof = proof.unwrap();
-            let inputs: [Fr; 0] = [];
-            let result = proof.verify(&vk, &inputs);
-            // Should return error, not panic
-            assert!(result.is_err());
-        }
-    }
-}
-
-// NOTE: A real Groth16 proof requires test vectors from a compiled circuit.
-// The verification algorithm itself is tested via the algorithm_tests module.
-mod algorithm_tests {
-    use bn::{Gt, G1, G2, Group};
-    use gnark_bn_verifier::vk::Groth16VKey;
-
-    // Import helper functions from parent scope
-    use crate::{create_valid_vk_bytes, create_valid_proof_bytes};
-
-    #[test]
-    fn test_pairing_with_generator_points() {
-        // Test that pairing of generator points completes without error
-        let g1 = G1::one();
-        let g2 = G2::one();
-
-        let result = bn::pairing_batch(&[(g1, g2.into())]);
-        // Just verify the operation completes - result is some Gt element
-        let _ = result;
-    }
-
-    #[test]
-    fn test_pairing_with_zero_point() {
-        // Test that e(0, any_point) = 1
-        let zero_g1 = G1::zero();
-        let g2 = G2::one();
-
-        let result = bn::pairing_batch(&[(zero_g1, g2.into())]);
+    fn pairing_with_zero_point_is_identity() {
+        let result = bn::pairing_batch(&[(G1::zero(), G2::one())]);
         assert_eq!(result, Gt::one());
-    }
-
-    #[test]
-    fn test_vk_debug_trait() {
-        // Verify Debug trait works for error messages
-        let buffer = vec![0u8; 100];
-        let result = Groth16VKey::try_from(buffer.as_slice());
-        assert!(result.is_err());
-        let err_str = result.unwrap_err().to_string();
-        assert!(!err_str.is_empty());
-        assert!(err_str.contains("too short"));
-    }
-
-    #[test]
-    fn test_verify_returns_error_on_invalid_proof() {
-        use gnark_bn_verifier::proof::Groth16Proof;
-
-        // Create a VK with 0 public inputs - using simple non-zero bytes
-        let mut vk_bytes = create_valid_vk_bytes(1);
-        // Set a valid-looking compressed point flag (0x02 = positive)
-        vk_bytes[0] = 0x02;
-        vk_bytes[64] = 0x02;
-        vk_bytes[128] = 0x02;
-        vk_bytes[224] = 0x02;
-
-        let vk_result = Groth16VKey::try_from(vk_bytes.as_slice());
-        if vk_result.is_err() {
-            // VK parsing correctly rejects invalid points - test passes
-            return;
-        }
-        let vk = vk_result.unwrap();
-
-        // Create a proof with non-zero bytes
-        let mut proof_bytes = create_valid_proof_bytes();
-        // Fill with non-zero to avoid zero point rejection
-        for byte in &mut proof_bytes {
-            *byte = 0x03;
-        }
-
-        let proof_result = Groth16Proof::try_from(proof_bytes.as_slice());
-        if proof_result.is_err() {
-            // Proof parsing correctly rejects invalid points - test passes
-            return;
-        }
-        let proof = proof_result.unwrap();
-
-        // Verify should fail (not panic), confirming the algorithm runs
-        let result = proof.verify(&vk, &[]);
-        // With garbage points, verification will fail which is expected
-        assert!(result.is_err());
     }
 }
